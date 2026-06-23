@@ -1,363 +1,351 @@
 from fastapi import FastAPI, HTTPException, Query
+from fastapi.middleware.cors import CORSMiddleware
 from dotenv import load_dotenv
+
 import pymysql
 import pymysql.cursors
 import os
-from datetime import datetime
+
+from datetime import datetime, date
 from typing import Optional
 
 load_dotenv()
 
 app = FastAPI(
     title="Rivery Pipeline Monitor API",
-    description="API to monitor Rivery pipeline logs, health, metrics and summaries",
+    description="API to monitor Rivery pipeline logs",
     version="1.0.0"
 )
 
-# ── DB Connection ─────────────────────────────────────────────
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],
+    allow_credentials=False,
+    allow_methods=["*"],
+    allow_headers=["*"],
+)
+
+
 def get_db():
     try:
-        conn = pymysql.connect(
+        return pymysql.connect(
             host=os.getenv("MYSQL_HOST"),
             port=int(os.getenv("MYSQL_PORT", 3306)),
             user=os.getenv("MYSQL_USER"),
             password=os.getenv("MYSQL_PASSWORD"),
             database=os.getenv("MYSQL_DATABASE"),
             cursorclass=pymysql.cursors.DictCursor,
-            connect_timeout=10
+            autocommit=True
         )
-        return conn
     except Exception as e:
-        raise HTTPException(status_code=500, detail=f"Database connection failed: {str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Database connection failed: {str(e)}"
+        )
 
 
-# ─────────────────────────────────────────────────────────────
-# 1. ROOT
-# ─────────────────────────────────────────────────────────────
-@app.get("/", tags=["Root"])
+@app.get("/")
 def root():
-    return {"message": "Rivery Pipeline Monitor API is running!"}
+    return {
+        "message": "Rivery Pipeline Monitor API Running",
+        "timestamp": datetime.utcnow()
+    }
 
 
-# ─────────────────────────────────────────────────────────────
-# 2. HEALTH
-# ─────────────────────────────────────────────────────────────
-@app.get("/health", tags=["Health"])
+@app.get("/health")
 def health():
+
+    conn = None
+
     try:
         conn = get_db()
+
         with conn.cursor() as cursor:
-            cursor.execute("SELECT COUNT(*) as total FROM rivery_runs")
-            total = cursor.fetchone()["total"]
-        conn.close()
+            cursor.execute(
+                "SELECT COUNT(*) AS total FROM rivery_runs"
+            )
+            result = cursor.fetchone()
+
         return {
             "status": "healthy",
             "database": "connected",
-            "total_logs_stored": total,
-            "timestamp": datetime.utcnow().isoformat()
+            "total_logs": result["total"]
         }
+
     except Exception as e:
+
         return {
             "status": "unhealthy",
-            "database": "disconnected",
-            "error": str(e),
-            "timestamp": datetime.utcnow().isoformat()
+            "error": str(e)
         }
 
+    finally:
+        if conn:
+            conn.close()
 
-# ─────────────────────────────────────────────────────────────
-# 3. PIPELINES
-# ─────────────────────────────────────────────────────────────
-@app.get("/pipelines", tags=["Pipelines"])
-def get_pipelines():
+
+@app.get("/pipelines")
+def pipelines():
+
     conn = get_db()
-    with conn.cursor() as cursor:
-        cursor.execute("""
+
+    try:
+
+        with conn.cursor() as cursor:
+
+            cursor.execute("""
+                SELECT
+                    river_name,
+                    river_id,
+                    COUNT(*) AS total_runs,
+                    SUM(CASE WHEN status='SUCCEEDED' THEN 1 ELSE 0 END) AS success_count,
+                    SUM(CASE WHEN status='FAILED' THEN 1 ELSE 0 END) AS failed_count,
+                    MAX(start_time) AS last_run_time
+                FROM rivery_runs
+                GROUP BY river_name, river_id
+                ORDER BY river_name
+            """)
+
+            rows = cursor.fetchall()
+
+        return {
+            "total_pipelines": len(rows),
+            "pipelines": rows
+        }
+
+    finally:
+        conn.close()
+
+
+@app.get("/logs/latest")
+def latest_logs(
+    from_date: Optional[date] = Query(None),
+    to_date: Optional[date] = Query(None),
+    limit: int = Query(100)
+):
+
+    conn = get_db()
+
+    try:
+
+        where = "WHERE 1=1"
+        params = []
+
+        if from_date:
+            where += " AND start_time >= %s"
+            params.append(from_date)
+
+        if to_date:
+            where += " AND start_time <= %s"
+            params.append(f"{to_date} 23:59:59")
+
+        sql = f"""
             SELECT
+                run_id,
                 river_name,
-                river_id,
-                COUNT(*) as total_runs,
-                SUM(CASE WHEN status = 'SUCCEEDED' THEN 1 ELSE 0 END) as success_count,
-                SUM(CASE WHEN status = 'FAILED' THEN 1 ELSE 0 END) as failed_count,
-                MAX(start_time) as last_run_time,
-                (SELECT status FROM rivery_runs r2
-                 WHERE r2.river_name = r1.river_name
-                 ORDER BY start_time DESC LIMIT 1) as last_run_status
-            FROM rivery_runs r1
-            GROUP BY river_name, river_id
-            ORDER BY river_name
-        """)
-        pipelines = cursor.fetchall()
-    conn.close()
-    return {"total_pipelines": len(pipelines), "pipelines": pipelines}
-
-
-# ─────────────────────────────────────────────────────────────
-# 4. LATEST LOGS
-# ─────────────────────────────────────────────────────────────
-@app.get("/logs/latest", tags=["Logs"])
-def get_latest_logs(
-    from_date: Optional[str] = Query(None, description="Format: YYYY-MM-DD"),
-    to_date: Optional[str] = Query(None, description="Format: YYYY-MM-DD")
-):
-    conn = get_db()
-    where = "WHERE 1=1"
-    params = []
-    if from_date:
-        where += " AND start_time >= %s"
-        params.append(from_date)
-    if to_date:
-        where += " AND start_time <= %s"
-        params.append(to_date + " 23:59:59")
-
-    with conn.cursor() as cursor:
-        cursor.execute(f"""
-            SELECT run_id, river_name, status, start_time, end_time,
-                   TIMESTAMPDIFF(SECOND, start_time, end_time) as duration_seconds,
-                   error_message
+                status,
+                start_time,
+                end_time,
+                error_message
             FROM rivery_runs
             {where}
             ORDER BY start_time DESC
-        """, params)
-        logs = cursor.fetchall()
-    conn.close()
-    return {"total": len(logs), "logs": logs}
+            LIMIT %s
+        """
+
+        params.append(limit)
+
+        with conn.cursor() as cursor:
+            cursor.execute(sql, params)
+            logs = cursor.fetchall()
+
+        return {
+            "total": len(logs),
+            "logs": logs
+        }
+
+    finally:
+        conn.close()
 
 
-# ─────────────────────────────────────────────────────────────
-# 5. FAILED LOGS
-# ─────────────────────────────────────────────────────────────
-@app.get("/logs/failed", tags=["Logs"])
-def get_failed_logs(
-    from_date: Optional[str] = Query(None, description="Format: YYYY-MM-DD"),
-    to_date: Optional[str] = Query(None, description="Format: YYYY-MM-DD")
-):
+@app.get("/logs/failed")
+def failed_logs():
+
     conn = get_db()
-    where = "WHERE status = 'FAILED'"
-    params = []
-    if from_date:
-        where += " AND start_time >= %s"
-        params.append(from_date)
-    if to_date:
-        where += " AND start_time <= %s"
-        params.append(to_date + " 23:59:59")
 
-    with conn.cursor() as cursor:
-        cursor.execute(f"""
-            SELECT run_id, river_name, status, start_time, end_time,
-                   TIMESTAMPDIFF(SECOND, start_time, end_time) as duration_seconds,
-                   error_message
-            FROM rivery_runs
-            {where}
-            ORDER BY start_time DESC
-        """, params)
-        logs = cursor.fetchall()
-    conn.close()
-    return {"total_failed": len(logs), "logs": logs}
+    try:
+
+        with conn.cursor() as cursor:
+
+            cursor.execute("""
+                SELECT
+                    run_id,
+                    river_name,
+                    status,
+                    start_time,
+                    end_time,
+                    error_message
+                FROM rivery_runs
+                WHERE status='FAILED'
+                ORDER BY start_time DESC
+            """)
+
+            logs = cursor.fetchall()
+
+        return {
+            "total_failed": len(logs),
+            "logs": logs
+        }
+
+    finally:
+        conn.close()
 
 
-# ─────────────────────────────────────────────────────────────
-# 6. SUCCESS LOGS
-# ─────────────────────────────────────────────────────────────
-@app.get("/logs/success", tags=["Logs"])
-def get_success_logs(
-    from_date: Optional[str] = Query(None, description="Format: YYYY-MM-DD"),
-    to_date: Optional[str] = Query(None, description="Format: YYYY-MM-DD")
-):
+@app.get("/logs/success")
+def success_logs():
+
     conn = get_db()
-    where = "WHERE status = 'SUCCEEDED'"
-    params = []
-    if from_date:
-        where += " AND start_time >= %s"
-        params.append(from_date)
-    if to_date:
-        where += " AND start_time <= %s"
-        params.append(to_date + " 23:59:59")
 
-    with conn.cursor() as cursor:
-        cursor.execute(f"""
-            SELECT run_id, river_name, status, start_time, end_time,
-                   TIMESTAMPDIFF(SECOND, start_time, end_time) as duration_seconds
-            FROM rivery_runs
-            {where}
-            ORDER BY start_time DESC
-        """, params)
-        logs = cursor.fetchall()
-    conn.close()
-    return {"total_success": len(logs), "logs": logs}
+    try:
+
+        with conn.cursor() as cursor:
+
+            cursor.execute("""
+                SELECT
+                    run_id,
+                    river_name,
+                    status,
+                    start_time,
+                    end_time
+                FROM rivery_runs
+                WHERE status='SUCCEEDED'
+                ORDER BY start_time DESC
+            """)
+
+            logs = cursor.fetchall()
+
+        return {
+            "total_success": len(logs),
+            "logs": logs
+        }
+
+    finally:
+        conn.close()
 
 
-# ─────────────────────────────────────────────────────────────
-# 7. LOGS BY PIPELINE NAME
-# ─────────────────────────────────────────────────────────────
-@app.get("/logs/{pipeline_name}", tags=["Logs"])
-def get_pipeline_logs(
-    pipeline_name: str,
-    from_date: Optional[str] = Query(None, description="Format: YYYY-MM-DD"),
-    to_date: Optional[str] = Query(None, description="Format: YYYY-MM-DD")
-):
+@app.get("/logs/{pipeline_name}")
+def pipeline_logs(pipeline_name: str):
+
     conn = get_db()
-    where = "WHERE river_name = %s"
-    params = [pipeline_name]
-    if from_date:
-        where += " AND start_time >= %s"
-        params.append(from_date)
-    if to_date:
-        where += " AND start_time <= %s"
-        params.append(to_date + " 23:59:59")
 
-    with conn.cursor() as cursor:
-        cursor.execute(f"""
-            SELECT run_id, river_name, status, start_time, end_time,
-                   TIMESTAMPDIFF(SECOND, start_time, end_time) as duration_seconds,
-                   error_message
-            FROM rivery_runs
-            {where}
-            ORDER BY start_time DESC
-        """, params)
-        logs = cursor.fetchall()
-    conn.close()
+    try:
 
-    if not logs:
-        raise HTTPException(status_code=404, detail=f"No logs found for pipeline: {pipeline_name}")
+        with conn.cursor() as cursor:
 
-    return {"pipeline_name": pipeline_name, "total": len(logs), "logs": logs}
+            cursor.execute("""
+                SELECT
+                    run_id,
+                    river_name,
+                    status,
+                    start_time,
+                    end_time,
+                    error_message
+                FROM rivery_runs
+                WHERE river_name=%s
+                ORDER BY start_time DESC
+            """, (pipeline_name,))
+
+            logs = cursor.fetchall()
+
+        if not logs:
+            raise HTTPException(
+                status_code=404,
+                detail=f"No logs found for {pipeline_name}"
+            )
+
+        return {
+            "pipeline_name": pipeline_name,
+            "total": len(logs),
+            "logs": logs
+        }
+
+    finally:
+        conn.close()
 
 
-# ─────────────────────────────────────────────────────────────
-# 8. SUMMARY
-# ─────────────────────────────────────────────────────────────
-@app.get("/summary", tags=["Summary"])
-def get_summary(
-    from_date: Optional[str] = Query(None, description="Format: YYYY-MM-DD"),
-    to_date: Optional[str] = Query(None, description="Format: YYYY-MM-DD")
-):
+@app.get("/summary")
+def summary():
+
     conn = get_db()
-    where = "WHERE 1=1"
-    params = []
-    if from_date:
-        where += " AND start_time >= %s"
-        params.append(from_date)
-    if to_date:
-        where += " AND start_time <= %s"
-        params.append(to_date + " 23:59:59")
 
-    with conn.cursor() as cursor:
-        cursor.execute(f"""
-            SELECT
-                COUNT(*) as total_runs,
-                SUM(CASE WHEN status = 'SUCCEEDED' THEN 1 ELSE 0 END) as total_success,
-                SUM(CASE WHEN status = 'FAILED' THEN 1 ELSE 0 END) as total_failed,
-                SUM(CASE WHEN status = 'RUNNING' THEN 1 ELSE 0 END) as total_running,
-                ROUND(SUM(CASE WHEN status = 'SUCCEEDED' THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 2) as overall_success_rate,
-                ROUND(AVG(TIMESTAMPDIFF(SECOND, start_time, end_time)), 2) as avg_duration_seconds
-            FROM rivery_runs {where}
-        """, params)
-        overall = cursor.fetchone()
+    try:
 
-        cursor.execute("""
-            SELECT
-                COUNT(*) as today_total,
-                SUM(CASE WHEN status = 'SUCCEEDED' THEN 1 ELSE 0 END) as today_success,
-                SUM(CASE WHEN status = 'FAILED' THEN 1 ELSE 0 END) as today_failed
-            FROM rivery_runs
-            WHERE DATE(start_time) = CURDATE()
-        """)
-        today = cursor.fetchone()
+        with conn.cursor() as cursor:
 
-        cursor.execute(f"""
-            SELECT
-                river_name,
-                COUNT(*) as total_runs,
-                SUM(CASE WHEN status = 'SUCCEEDED' THEN 1 ELSE 0 END) as success_count,
-                SUM(CASE WHEN status = 'FAILED' THEN 1 ELSE 0 END) as failed_count,
-                ROUND(SUM(CASE WHEN status = 'SUCCEEDED' THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 2) as success_rate,
-                MAX(start_time) as last_run_time,
-                ROUND(AVG(TIMESTAMPDIFF(SECOND, start_time, end_time)), 2) as avg_duration_seconds
-            FROM rivery_runs {where}
-            GROUP BY river_name
-            ORDER BY river_name
-        """, params)
-        per_pipeline = cursor.fetchall()
+            cursor.execute("""
+                SELECT
+                    COUNT(*) AS total_runs,
+                    SUM(CASE WHEN status='SUCCEEDED' THEN 1 ELSE 0 END) AS success_count,
+                    SUM(CASE WHEN status='FAILED' THEN 1 ELSE 0 END) AS failed_count,
+                    ROUND(
+                        SUM(CASE WHEN status='SUCCEEDED' THEN 1 ELSE 0 END)
+                        * 100.0 / COUNT(*),
+                        2
+                    ) AS success_rate
+                FROM rivery_runs
+            """)
 
-    conn.close()
-    return {"overall": overall, "today": today, "per_pipeline": per_pipeline}
+            result = cursor.fetchone()
+
+        return result
+
+    finally:
+        conn.close()
 
 
-# ─────────────────────────────────────────────────────────────
-# 9. METRICS
-# ─────────────────────────────────────────────────────────────
-@app.get("/metrics", tags=["Metrics"])
-def get_metrics():
+@app.get("/metrics")
+def metrics():
+
     conn = get_db()
-    with conn.cursor() as cursor:
-        cursor.execute("""
-            SELECT
-                river_name,
-                COUNT(*) as total_runs,
-                SUM(CASE WHEN status = 'SUCCEEDED' THEN 1 ELSE 0 END) as total_success,
-                SUM(CASE WHEN status = 'FAILED' THEN 1 ELSE 0 END) as total_failed,
-                ROUND(SUM(CASE WHEN status = 'FAILED' THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 2) as failure_rate,
-                ROUND(SUM(CASE WHEN status = 'SUCCEEDED' THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 2) as success_rate,
-                MAX(start_time) as last_run_time,
-                MAX(CASE WHEN status = 'FAILED' THEN start_time END) as last_failed_time,
-                MAX(CASE WHEN status = 'FAILED' THEN error_message END) as last_error_message,
-                ROUND(AVG(TIMESTAMPDIFF(SECOND, start_time, end_time)), 2) as avg_duration_seconds,
-                MAX(TIMESTAMPDIFF(SECOND, start_time, end_time)) as longest_run_seconds,
-                MIN(TIMESTAMPDIFF(SECOND, start_time, end_time)) as shortest_run_seconds,
-                (SELECT status FROM rivery_runs r2
-                 WHERE r2.river_name = r1.river_name
-                 ORDER BY start_time DESC LIMIT 1) as last_run_status
-            FROM rivery_runs r1
-            GROUP BY river_name
-            ORDER BY river_name
-        """)
-        pipeline_metrics = cursor.fetchall()
 
-        cursor.execute("""
-            SELECT river_name, COUNT(*) as failed_count
-            FROM rivery_runs WHERE status = 'FAILED'
-            GROUP BY river_name
-            ORDER BY failed_count DESC LIMIT 1
-        """)
-        most_failing = cursor.fetchone()
+    try:
 
-        cursor.execute("""
-            SELECT river_name, COUNT(*) as total_runs
-            FROM rivery_runs
-            GROUP BY river_name
-            ORDER BY total_runs DESC LIMIT 1
-        """)
-        most_active = cursor.fetchone()
+        with conn.cursor() as cursor:
 
-        cursor.execute("""
-            SELECT river_name, MAX(start_time) as last_run_time
-            FROM rivery_runs
-            GROUP BY river_name
-            HAVING MAX(start_time) < NOW() - INTERVAL 1 HOUR
-        """)
-        stuck_pipelines = cursor.fetchall()
+            cursor.execute("""
+                SELECT
+                    river_name,
+                    COUNT(*) AS total_runs,
+                    SUM(CASE WHEN status='SUCCEEDED' THEN 1 ELSE 0 END) AS success_count,
+                    SUM(CASE WHEN status='FAILED' THEN 1 ELSE 0 END) AS failed_count,
+                    ROUND(
+                        SUM(CASE WHEN status='FAILED' THEN 1 ELSE 0 END)
+                        * 100.0 / COUNT(*),
+                        2
+                    ) AS failure_rate
+                FROM rivery_runs
+                GROUP BY river_name
+                ORDER BY river_name
+            """)
 
-        cursor.execute("""
-            SELECT
-                COUNT(DISTINCT river_name) as total_pipelines,
-                COUNT(*) as total_runs,
-                SUM(CASE WHEN status = 'SUCCEEDED' THEN 1 ELSE 0 END) as total_success,
-                SUM(CASE WHEN status = 'FAILED' THEN 1 ELSE 0 END) as total_failed,
-                ROUND(SUM(CASE WHEN status = 'SUCCEEDED' THEN 1 ELSE 0 END) * 100.0 / COUNT(*), 2) as overall_success_rate,
-                ROUND(AVG(TIMESTAMPDIFF(SECOND, start_time, end_time)), 2) as overall_avg_duration_seconds,
-                SUM(CASE WHEN DATE(start_time) = CURDATE() THEN 1 ELSE 0 END) as total_runs_today,
-                SUM(CASE WHEN DATE(start_time) = CURDATE() AND status = 'FAILED' THEN 1 ELSE 0 END) as failed_today,
-                SUM(CASE WHEN DATE(start_time) = CURDATE() AND status = 'SUCCEEDED' THEN 1 ELSE 0 END) as success_today
-            FROM rivery_runs
-        """)
-        overall = cursor.fetchone()
+            data = cursor.fetchall()
 
-    conn.close()
-    return {
-        "overall": overall,
-        "most_failing_pipeline": most_failing,
-        "most_active_pipeline": most_active,
-        "stuck_pipelines": stuck_pipelines,
-        "per_pipeline": pipeline_metrics
-    }
+        return {
+            "total_pipelines": len(data),
+            "pipelines": data
+        }
+
+    finally:
+        conn.close()
+
+
+if __name__ == "__main__":
+
+    import uvicorn
+
+    uvicorn.run(
+        "rivery_api:app",
+        host="0.0.0.0",
+        port=8001,
+        reload=True
+    )
